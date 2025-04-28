@@ -3,81 +3,80 @@ from sklearn.model_selection import train_test_split, RandomizedSearchCV, KFold,
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RationalQuadratic, WhiteKernel
+from sklearn.gaussian_process.kernels import (
+    RBF, RationalQuadratic, Matern, DotProduct, WhiteKernel, ConstantKernel as C
+)
 from sklearn.pipeline import Pipeline
-from sklearn.feature_selection import SelectKBest, f_regression
-from scipy.stats import uniform, randint
 import joblib
 import numpy as np
 import pandas as pd
+from scipy.stats import uniform
 
 if __name__ == "__main__":
-    # Load configs
     config = load_config()
-
-    # Load dataset
     images, distances = load_dataset(config)
     print(f"[INFO]: Dataset loaded with {len(images)} samples.")
 
-    # Split into train and validation
     X_train, X_val, y_train, y_val = train_test_split(images, distances, test_size=0.2, random_state=42)
 
-    # Define kernel (RationalQuadratic + WhiteKernel)
-    base_kernel = RationalQuadratic(length_scale=1.0, alpha=1.0) + WhiteKernel(noise_level=1.0)
-    regressor = GaussianProcessRegressor(kernel=base_kernel, normalize_y=True, random_state=42)
+    def kernel_sampler():
+        kernels = []
+        for _ in range(50):  # Sample 50 different kernel combinations
+            ls = np.random.uniform(0.1, 5.0)
+            alpha = np.random.uniform(0.1, 5.0)
+            nu = np.random.choice([0.5, 1.5, 2.5])
+            noise = np.random.uniform(1e-3, 1.0)
 
-    # Build pipeline with SelectKBest before PCA
+            kernels.extend([
+                C(1.0) * RBF(length_scale=ls),
+                C(1.0) * RationalQuadratic(length_scale=ls, alpha=alpha),
+                C(1.0) * Matern(length_scale=ls, nu=nu),
+                C(1.0) * (RBF(length_scale=ls) + WhiteKernel(noise_level=noise)),
+                C(1.0) * (RationalQuadratic(length_scale=ls, alpha=alpha) + WhiteKernel(noise_level=noise)),
+                C(1.0) * (DotProduct() + WhiteKernel(noise_level=noise)),
+            ])
+        return kernels
+
+    # Build pipeline
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
-        ('selectk', SelectKBest(score_func=f_regression)),
         ('pca', PCA()),
-        ('regressor', regressor)
+        ('regressor', GaussianProcessRegressor(normalize_y=True, random_state=42))
     ])
 
-    # Define param distribution for RandomizedSearchCV
     param_dist = {
-        'selectk__k': randint(20, 150),  # Number of features to select
-        'pca__n_components': randint(30, 200),  # Number of PCA components
-        'regressor__alpha': uniform(1e-10, 1),  # Alpha parameter for GPR
-        'regressor__kernel__k1__length_scale': uniform(0.1, 5.0),  # RationalQuadratic length_scale
-        'regressor__kernel__k1__alpha': uniform(0.1, 5.0),  # RationalQuadratic alpha
-        'regressor__kernel__k2__noise_level': uniform(1e-5, 1e-1)  # WhiteKernel noise_level
+        'pca__n_components': [20, 30, 40, 50, 60, 70],
+        'regressor__alpha': uniform(1e-4, 1e-1),
+        'regressor__kernel': kernel_sampler()
     }
 
-    # K-Fold cross-validation setup
     cv = KFold(n_splits=10, shuffle=True, random_state=42)
 
-    # Setup RandomizedSearchCV
     random_search = RandomizedSearchCV(
-        estimator=pipeline,
+        pipeline,
         param_distributions=param_dist,
-        n_iter=50,
+        n_iter=30,  # You can increase this to explore more combinations
         cv=cv,
         scoring='neg_mean_absolute_error',
-        verbose=2,
         n_jobs=-1,
-        return_train_score=True,
+        verbose=2,
         random_state=42
     )
 
-    # Fit RandomizedSearchCV
     random_search.fit(X_train, y_train)
     print(f"[INFO]: Best parameters found: {random_search.best_params_}")
 
-    # Evaluate on validation set
+    # Evaluate
     val_preds = random_search.predict(X_val)
     print_results(y_val, val_preds)
 
-    # Save best pipeline
     joblib.dump(random_search.best_estimator_, config["data_dir"] / "pipeline.joblib")
     print("[INFO]: Best pipeline saved to data/pipeline.joblib")
 
-    # Save all search results
     results_df = pd.DataFrame(random_search.cv_results_)
     results_df.to_csv(config["data_dir"] / "randomsearch_results.csv", index=False)
-    print("[INFO]: RandomSearchCV results saved to randomsearch_results.csv")
+    print("[INFO]: RandomizedSearchCV results saved to randomsearch_results.csv")
 
-    # Cross-validated predictions on training set
     cv_preds = cross_val_predict(random_search.best_estimator_, X_train, y_train, cv=cv, n_jobs=-1)
     cv_scores = np.abs(y_train - cv_preds)
 
@@ -89,13 +88,7 @@ if __name__ == "__main__":
     cv_results_df.to_csv(config["data_dir"] / "cv_scores.csv", index=False)
     print("[INFO]: Cross-validation scores saved to cv_scores.csv")
 
-    # Load test data
-    test_images = load_test_dataset(config)
-    test_images = np.array(test_images)
-
-    # Predict on test set
+    test_images = np.array(load_test_dataset(config))
     test_preds = random_search.predict(test_images)
-
-    # Save test predictions
     save_results(test_preds)
     print("[INFO]: Predictions saved to prediction.csv")
